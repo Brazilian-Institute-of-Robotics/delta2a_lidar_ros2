@@ -1,6 +1,6 @@
 # delta2a_lidar — ROS2 Driver for 3iRobotics Delta-2A LiDAR
 
-A ROS2 (Jazzy Jalisco) driver for the **3iRobotics Delta-2A** triangulation LiDAR.  
+A ROS2 (Jazzy Jalisco) driver for the **3iRobotics Delta-2A** triangulation LiDAR.
 Publishes standard `sensor_msgs/LaserScan` messages compatible with Nav2, slam_toolbox, and RViz2.
 
 > **Why this exists:** No official ROS2 driver exists for the Delta-2A. This driver was written from scratch by reverse-engineering the raw serial protocol from hex dumps of the device's actual output.
@@ -168,27 +168,27 @@ ros2 run delta2a_lidar lidar_node \
 | `/scan` | `sensor_msgs/msg/LaserScan` | 360° laser scan, ~6–7 Hz |
 
 ---
-
 ## Protocol Notes
 
-The Delta-2A uses a **proprietary binary serial protocol** — not the standard RPLIDAR protocol.
+The Delta-2A uses a **proprietary binary serial protocol**. **Packet sizes are dynamic** and depend on the motor's rotation speed (RPM).
 
-```
-Packet structure (168 bytes fixed):
+```text
+Packet structure (Dynamic size):
 
-  Byte 00-01 : AA 00          — sync header
-  Byte 02    : A6             — content type (scan packet)
-  Byte 03-10 : device info    — ignored
-  Byte 11-12 : FSA (uint16 BE)— first sample angle = value / 100.0 degrees
-  Byte 13-165: 51 × 3 bytes  — [dist_L, dist_H, quality]
-                                dist_mm = (dist_H << 8) | dist_L
-                                quality = 0 means no return (discard)
-  Byte 166-167: checksum     — currently not validated
+  Byte 00     : AA          — Sync header
+  Byte 01-02  : 00 XX       — 16-bit packet length (e.g., 0xA6=166, 0x82=130)
+  Byte 03     : 01          — Unknown, ignored
+  Byte 04     : 61          — Command Type (CT_SCAN = 0x61)
+  Byte 05-10  : device info — ignored
+  Byte 11-12  : FSA (uint16 BE) — First Sample Angle = value / 100.0 degrees
+  Byte 13...  : N × 3 bytes — Array of samples [dist_L, dist_H, quality]
+                              dist_mm = (dist_H << 8) | dist_L
+                              quality = 0 means no return (discard)
+  Last 2 bytes: Checksum    — currently not validated
 
 Baud rate : 230400
-Packets/revolution : 16
-Angular span/packet: 22.5°
-Samples/packet     : 51
+Angular span/packet: 22.5° (Fixed, regardless of sample count)
+Samples/packet (N) : Dynamic, calculated as: (Packet_Length + 2 - 15) // 3
 ```
 
 A secondary packet type `CT=0xA3` (speed/status) is also emitted by the hardware and silently ignored by this driver.
@@ -279,6 +279,10 @@ MIT License — free to use, modify, and distribute.
 
 ## Author
 
-**Azimbek Mustafokulov** — [@krranky](https://github.com/krranky)  
-Mechanical engineering student, Tashkent  
+**Azimbek Mustafokulov** — [@krranky](https://github.com/krranky)
+Mechanical engineering student, Tashkent
 Building robots in free time 🤖
+
+### Update
+**Lucas Marins** - [@lucasmarbatista](https://github.com/lucasmarbatista)
+Robotics Specialist - SENAI CIMATEC (BIR)
