@@ -1,14 +1,21 @@
 """
-3iRobotics Delta-2A LiDAR ROS2 driver — protocol reverse-engineered from hex dump.
+3iRobotics Delta-2A LiDAR ROS2 driver —
+Corrected protocol, reverse-engineered from hex dump.
 
-Packet format (168 bytes fixed):
-  Byte  0-1 : AA 00            — sync header
-  Byte  2   : A6               — CT (scan packet)
-  Byte  3   : 01               — unknown, ignored
-  Bytes 4-10: constant 7 bytes — device info, ignored
-  Bytes 11-12: FSA big-endian  — first sample angle, degrees = val / 100.0
-  Bytes 13-165: 51 × 3 bytes  — [dist_L dist_H qual], dist in mm (no shift)
-  Bytes 166-167: checksum     — ignored for now
+Packet format (Dynamic size based on motor speed):
+  Byte 0      : AA        — Sync header 1
+  Bytes 1-2   : 00 XX     — 16-bit packet length (e.g., 0xA6=166, 0x82=130, 0x7F=127)
+  Byte 3      : 01        — Unknown, ignored
+  Byte 4      : 61        — Command Type (CT_SCAN = 0x61)
+  Bytes 5-10  : 6 bytes   — Device info, ignored
+  Bytes 11-12 : FSA       — First Sample Angle (big-endian), degrees = val / 100.0
+  Bytes 13... : N × 3     — Array of samples [dist_L, dist_H, qual], dist in mm (no shift)
+  Last 2 bytes: Checksum  — Ignored for now
+
+Notes:
+  - Total Packet Size = (Value of Bytes 1 and 2) + 2 bytes
+  - Number of samples (N) = (Total Size - 15) // 3
+  - Each packet covers an exact fixed arc of 22.5°, regardless of the number of samples.
 
 Baud rate: 230400
 """
@@ -20,12 +27,12 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 
+# Headers start byte
 HEADER_1    = 0xAA
 HEADER_2    = 0x00
-CT_SCAN     = 0xA6
-PACKET_SIZE = 168
+#  Packate size is variable, depends on the velocity
+#  CT_SCAN, PACKET_SIZE e NUM_SAMPLES are not fix.
 HEADER_SIZE = 13
-NUM_SAMPLES = 51
 
 BAUD_RATE   = 230400
 SERIAL_PORT = '/dev/ttyUSB0'
@@ -60,7 +67,6 @@ class Delta2ANode(Node):
         self._scan: dict[float, float] = {}
         self._prev_fsa: float = -1.0
 
-        # Configure port with stty first (same as what fixed the raw bytes issue)
         try:
             subprocess.run(
                 ['stty', '-F', port, str(baud), 'raw', 'cs8', '-cstopb', '-parenb'],
@@ -87,7 +93,6 @@ class Delta2ANode(Node):
         self._buf = bytearray()
         self.create_timer(0.001, self._read_loop)
 
-    # ------------------------------------------------------------------
     def _read_loop(self):
         try:
             waiting = self._ser.in_waiting
@@ -98,7 +103,6 @@ class Delta2ANode(Node):
             return
         self._parse_buffer()
 
-    # ------------------------------------------------------------------
     def _parse_buffer(self):
         buf = self._buf
 
@@ -117,26 +121,34 @@ class Delta2ANode(Node):
             if idx > 0:
                 buf = buf[idx:]
 
-            # Need full packet
-            if len(buf) < PACKET_SIZE:
+            # Need at least 3 bytes to be able to read the package
+            if len(buf) < 3:
                 break
 
-            ct = buf[2]
+            # buf[1] and buf[2] represent the length with 16 bits.
+            # The package has 255 bytes fix, buff[1] is always 0x00 and buf[2]
+            # change dynamically to 0xA6, 0x82 and 0x7F
+            pkt_len = (buf[1] << 8) | buf[2]
+            total_size = pkt_len + 2  # +2 bytes (Byte Start e Checksum)
 
-            if ct == CT_SCAN:
-                self._process_packet(buf[:PACKET_SIZE])
-                buf = buf[PACKET_SIZE:]
+            #  Wait the full package.
+            if len(buf) < total_size:
+                break
+
+            # Command Type is in the byte 4
+            # 0x61 is the byte to find the distance package
+            if buf[4] == 0x61:
+                self._process_packet(buf[:total_size])
             else:
-                # Unknown CT — log and skip this header
                 self.get_logger().warn(
-                    f'Unknown CT=0x{ct:02X} at buf[2], skipping header',
+                    f'Unknown packet type 0x{buf[4]:02X} at buf[4], skipping',
                     throttle_duration_sec=2.0
                 )
-                buf = buf[1:]  # skip one byte and re-search
+
+            buf = buf[total_size:]
 
         self._buf = bytearray(buf)
 
-    # ------------------------------------------------------------------
     def _process_packet(self, pkt: bytearray):
         # FSA: big-endian uint16 at bytes 11-12
         fsa_deg = fsa_to_degrees(pkt[11], pkt[12])
@@ -148,11 +160,19 @@ class Delta2ANode(Node):
 
         self._prev_fsa = fsa_deg
 
-        # Angle step per sample (~0.44° based on 22.5° span / 51 samples)
-        angle_step = 22.5 / NUM_SAMPLES
+        # Calculate number of samples dynamically
+        # Total = len(pkt)
+        # Header = 13 bytes, Checksum = 2 bytes (Total of 15 bytes, not samples)
+        # Each sample = 3 bytes
+        num_samples = (len(pkt) - 15) // 3
 
-        # Parse 51 samples: [dist_L dist_H qual] from byte 13
-        for i in range(NUM_SAMPLES):
+        if num_samples <= 0:
+            return
+
+        # Each package presents 22.5° degrees fixed, it does not depend on the velocity
+        angle_step = 22.5 / num_samples
+
+        for i in range(num_samples):
             base = HEADER_SIZE + i * 3
             dist_l = pkt[base]
             dist_h = pkt[base + 1]
@@ -168,7 +188,6 @@ class Delta2ANode(Node):
                 angle_deg = fsa_deg + i * angle_step
                 self._scan[angle_deg % 360.0] = dist_m
 
-    # ------------------------------------------------------------------
     def _publish_scan(self):
         if len(self._scan) < 10:
             return
@@ -200,7 +219,6 @@ class Delta2ANode(Node):
             throttle_duration_sec=1.0
         )
 
-    # ------------------------------------------------------------------
     def destroy_node(self):
         if hasattr(self, '_ser') and self._ser.is_open:
             self._ser.close()
@@ -217,3 +235,6 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
